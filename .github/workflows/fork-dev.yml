@@ -1,0 +1,109 @@
+# Fork-only workflow. NOT part of the upstream repository.
+#
+# The development machine used for this work cannot compile the project
+# locally, so this job runs the same gates the upstream CI enforces and also
+# publishes a statically linked binary that can be installed on that machine to
+# verify the behaviour by hand.
+#
+# Drop the commit that adds this file before opening a pull request upstream.
+name: fork-dev
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'dev/**'
+
+permissions: {}
+
+jobs:
+  check:
+    name: Check, test and build binary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Install Rust (pinned, same as upstream CI)
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: 1.89
+          targets: x86_64-unknown-linux-musl
+          components: clippy
+
+      - name: Install Rust (nightly, for rustfmt)
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: nightly
+          components: rustfmt
+
+      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60
+        with:
+          tool: nextest,cargo-insta
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The lint steps do not stop the job, so that a single run reports every
+      # problem at once. Check the step conclusions, not just the job's.
+      - name: Check formatting
+        continue-on-error: true
+        run: cargo +nightly fmt --all -- --check
+
+      - name: Clippy
+        continue-on-error: true
+        run: cargo +1.89 clippy --all-features --workspace --all-targets -- -D warnings
+
+      # This machine cannot run `cargo insta` locally, so accept the snapshots
+      # here and hand them back as a patch. Genuine test failures still fail
+      # this step; only snapshot mismatches are absorbed, and the next step
+      # turns those into a failure.
+      - name: Test
+        run: >-
+          cargo +1.89 insta test --accept
+          --workspace --all-features --test-runner nextest
+        env:
+          RUST_BACKTRACE: 1
+          CARGO_TERM_COLOR: always
+
+      - name: Check for accepted snapshot changes
+        if: ${{ !cancelled() }}
+        run: |
+          git diff > insta.patch
+          if [ -s insta.patch ]; then
+            echo '::error::snapshots changed; see the insta-patch artifact'
+            cat insta.patch
+            exit 1
+          fi
+
+      - name: Publish snapshot updates
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: insta-patch
+          path: insta.patch
+          if-no-files-found: ignore
+
+      - name: Doc tests
+        if: ${{ !cancelled() }}
+        run: cargo +1.89 test --workspace --doc
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Build statically linked binary
+        if: ${{ !cancelled() }}
+        run: cargo +1.89 build --release --target x86_64-unknown-linux-musl
+
+      - name: Publish binary artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: jj-x86_64-unknown-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/jj
